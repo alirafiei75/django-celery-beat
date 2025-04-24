@@ -519,7 +519,7 @@ class test_DatabaseScheduler(SchedulerCase):
 
         # distant future time (should not be in schedule)
         self.m11 = self.create_model_crontab(
-            crontab(hour=str((now_hour + 2) % 24)))
+            crontab(hour=str((now_hour + 3) % 24)))
         self.m11.save()
         self.m11.refresh_from_db()
 
@@ -537,15 +537,6 @@ class test_DatabaseScheduler(SchedulerCase):
         assert 'celery.backend_cleanup' in sched
         for n, e in sched.items():
             assert isinstance(e, self.s.Entry)
-
-    def test_get_excluded_hours_for_crontab_tasks(self):
-        now_hour = timezone.localtime(timezone.now()).hour
-        excluded_hours = self.s.get_excluded_hours_for_crontab_tasks()
-
-        assert str(now_hour) not in excluded_hours
-        assert str((now_hour + 1) % 24) not in excluded_hours
-        assert str((now_hour - 1) % 24) not in excluded_hours
-        assert str(4) not in excluded_hours
 
     def test_schedule_changed(self):
         self.m2.args = '[16, 16]'
