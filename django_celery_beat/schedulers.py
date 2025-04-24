@@ -289,9 +289,11 @@ class DatabaseScheduler(Scheduler):
 
         # Previous, current, and next hour in server timezone
         hours_to_include = [
-            (server_hour - 1) % 24,  # previous hour
-            server_hour,             # current hour
-            (server_hour + 1) % 24,  # next hour
+            (server_hour - 2) % 24,
+            (server_hour - 1) % 24,
+            server_hour,
+            (server_hour + 1) % 24,
+            (server_hour + 2) % 24,
             4,                       # hour 4 (celery's default cleanup task)
         ]
 
@@ -334,7 +336,7 @@ class DatabaseScheduler(Scheduler):
 
         # Build the final exclude query:
         # Exclude crontab tasks that are not in our include list
-        exclude_query = Q(crontab__isnull=False) & ~Q(crontab__id__in=excluded_hour_task_ids)
+        exclude_query = Q(crontab__isnull=False) & Q(crontab__id__in=excluded_hour_task_ids)
 
         return exclude_query
 
