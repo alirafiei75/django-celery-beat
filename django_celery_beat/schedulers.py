@@ -260,18 +260,140 @@ class DatabaseScheduler(Scheduler):
         exclude_clock_tasks_query = Q(
             clocked__isnull=False, clocked__clocked_time__gt=next_five_minutes
         )
-        exclude_hours = self.get_excluded_hours_for_crontab_tasks()
-        exclude_cron_tasks_query = Q(
-            crontab__isnull=False, crontab__hour__in=exclude_hours
-        )
-        for model in self.Model.objects.enabled().exclude(
-            exclude_clock_tasks_query | exclude_cron_tasks_query
-        ):
+        
+        # Get hours to exclude based on crontab tasks with timezone-adjusted server hour
+        exclude_cron_tasks_query = self._get_crontab_exclude_query()
+        
+        # Combine the queries for optimal database filtering
+        exclude_query = exclude_clock_tasks_query | exclude_cron_tasks_query
+        
+        # Fetch only the tasks we need to consider
+        for model in self.Model.objects.enabled().exclude(exclude_query):
             try:
                 s[model.name] = self.Entry(model, app=self.app)
             except ValueError:
                 pass
         return s
+        
+    def _get_crontab_exclude_query(self):
+        """
+        Build a query to exclude crontab tasks based on their hour value,
+        adjusted for timezone differences relative to the server.
+        
+        This creates an annotation for each crontab task that represents the 
+        server-equivalent hour, then filters on that annotation.
+        """
+        # Get server time and timezone
+        server_time = timezone.localtime(now())
+        server_hour = server_time.hour
+        
+        # Previous, current, and next hour in server timezone
+        hours_to_include = [
+            (server_hour - 1) % 24,  # previous hour
+            server_hour,             # current hour
+            (server_hour + 1) % 24,  # next hour
+            4,                       # hour 4 (celery's default cleanup task)
+        ]
+        
+        # Get all crontab tasks with non-wildcard hour field
+        crontab_tasks = CrontabSchedule.objects.exclude(hour='*')
+        
+        # Annotate each task with its "server hour" equivalent
+        from django.db.models.functions import Cast
+        from django.db.models import F, Value, IntegerField, Case, When
+        
+        # First, filter out tasks with complex hour patterns
+        # We'll handle only numeric hour values at the database level
+        exclude_complex_patterns = ~(
+            Q(hour__contains=',') | 
+            Q(hour__contains='-') | 
+            Q(hour__contains='/')
+        )
+        
+        # Create a base queryset with numeric hours only
+        hour_tasks = crontab_tasks.filter(exclude_complex_patterns)
+        
+        # Add an annotation that converts the task's hour to an integer
+        # and adjusts it to the server timezone
+        annotated_tasks = hour_tasks.annotate(
+            # First cast the hour string to an integer
+            hour_int=Cast('hour', IntegerField()),
+            
+            # Then calculate the timezone offset between the task's timezone and server timezone
+            # This is a simplified calculation - actual implementation would need to account for DST
+            # Using F() expressions to do calculations at the database level
+            server_hour=Case(
+                # Handle specific case for each timezone
+                *[
+                    When(
+                        timezone=timezone_name,
+                        then=(F('hour_int') + self._get_timezone_offset(timezone_name)) % 24
+                    ) 
+                    for timezone_name in self._get_unique_timezone_names()
+                ],
+                # Default case - treat as server timezone
+                default=F('hour_int')
+            )
+        )
+        
+        # Get the IDs of tasks that have their server_hour in our include list
+        include_task_ids = annotated_tasks.filter(server_hour__in=hours_to_include).values_list('id', flat=True)
+        
+        # Get the IDs of tasks with wildcard or complex patterns
+        wildcard_task_ids = CrontabSchedule.objects.filter(
+            Q(hour='*') |
+            Q(hour__contains=',') | 
+            Q(hour__contains='-') | 
+            Q(hour__contains='/')
+        ).values_list('id', flat=True)
+        
+        # Combine all task IDs to include
+        all_included_ids = list(include_task_ids) + list(wildcard_task_ids)
+        
+        # Build the exclude query: exclude tasks not in our include list
+        # and that have a crontab schedule
+        exclude_query = Q(crontab__isnull=False) & ~Q(crontab__id__in=all_included_ids)
+        
+        return exclude_query
+        
+    def _get_unique_timezone_names(self):
+        """Get a list of all unique timezone names used in CrontabSchedule"""
+        return CrontabSchedule.objects.values_list('timezone', flat=True).distinct()
+        
+    def _get_timezone_offset(self, timezone_name):
+        """
+        Calculate the hour offset between the given timezone and server timezone.
+        
+        Args:
+            timezone_name: The name of the timezone
+            
+        Returns:
+            int: The hour offset to add to convert from timezone's hour to server hour
+        """
+        # Get server timezone
+        server_tz = timezone.get_current_timezone()
+        
+        # Get target timezone
+        import pytz
+        try:
+            target_tz = pytz.timezone(timezone_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            # If timezone is unknown, assume no offset
+            return 0
+            
+        # Use a fixed point in time for the calculation to avoid DST issues
+        fixed_dt = datetime.datetime(2023, 1, 1, 12, 0, 0)
+        
+        # Calculate the offset
+        dt1 = fixed_dt.replace(tzinfo=server_tz)
+        dt2 = fixed_dt.replace(tzinfo=target_tz)
+        
+        # Calculate hour difference
+        offset_seconds = (dt1.utcoffset().total_seconds() - dt2.utcoffset().total_seconds())
+        offset_hours = int(offset_seconds / 3600)
+        
+        # Return negative offset because we want to convert FROM target TO server
+        return -offset_hours
 
     def schedule_changed(self):
         try:
