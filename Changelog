@@ -42,9 +42,17 @@ Next
   Relying on the raw ``last_update`` column will under-report changes
   after ordinary saves, with no error.
 
-  Documented call sites are unchanged: ``PeriodicTasks.update_changed()`` /
-  ``PeriodicTasks.changed()`` are still the correct way to notify Beat after
-  bulk ``queryset.update()``.
+- After bulk ``queryset.update()``, call ``PeriodicTasks.update_changed()``
+  so Beat notices the change. ``PeriodicTasks.changed()`` is the delete
+  signal handler and is not the bulk-update API.
+
+- ``PeriodicTask.save(update_fields=...)`` now includes ``date_changed``
+  (and schedule models include ``updated_at``) so partial saves stay
+  visible to Beat. Saves inside ``atomic()`` restamp that field after
+  commit so overlapping transactions cannot hide a change behind an
+  older save-time ``MAX()``. Beat's own ``last_run_at`` /
+  ``total_run_count`` housekeeping saves are excluded.
+
 - Use the stable Django 6.1 release in the test matrix.
 
 .. _version-2.9.0:

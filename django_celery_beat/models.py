@@ -90,7 +90,75 @@ def crontab_schedule_celery_timezone():
     return 'UTC'
 
 
-class SolarSchedule(models.Model):
+# Beat's ModelEntry.save() only persists run metadata. Those fields must not
+# bump date_changed or the scheduler reloads itself on every tick.
+_PERIODIC_TASK_HOUSEKEEPING_FIELDS = frozenset({
+    'last_run_at', 'total_run_count',
+})
+
+
+def _ensure_tracking_in_update_fields(
+        kwargs, tracking_field, housekeeping_fields=frozenset()):
+    """Include ``tracking_field`` in ``update_fields`` for real edits.
+
+    Django skips ``auto_now`` when the field is omitted from
+    ``update_fields``, which would make ``MAX()`` change detection miss the
+    save. Housekeeping updates (run count / last run) are left alone so Beat
+    does not reload the schedule on every tick.
+
+    Returns True when this save should be ignored for change detection.
+    """
+    update_fields = kwargs.get('update_fields')
+    if update_fields is None:
+        return False
+    update_fields = set(update_fields)
+    if not (update_fields - housekeeping_fields):
+        return True
+    update_fields.add(tracking_field)
+    kwargs['update_fields'] = list(update_fields)
+    return False
+
+
+def _restamp_tracking_field_on_commit(model_cls, pk, field_name, using=None):
+    """Rewrite the tracking timestamp after commit when inside a transaction.
+
+    ``auto_now`` records save time, not commit time. A later-committing
+    transaction can therefore carry an older stamp than one Beat already
+    consumed. Updating the row after commit makes ``MAX()`` follow
+    visibility order. Autocommit saves are left as a single write.
+    """
+    if pk is None:
+        return
+    if not transaction.get_connection(using).in_atomic_block:
+        return
+
+    def _touch():
+        manager = model_cls._default_manager
+        if using:
+            manager = manager.using(using)
+        manager.filter(pk=pk).update(**{field_name: now()})
+
+    transaction.on_commit(_touch, using=using)
+
+
+class TimestampedScheduleMixin(models.Model):
+    """Keep ``updated_at`` visible to pull-based Beat change detection."""
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        skip_change_detection = _ensure_tracking_in_update_fields(
+            kwargs, 'updated_at',
+        )
+        super().save(*args, **kwargs)
+        if not skip_change_detection:
+            _restamp_tracking_field_on_commit(
+                type(self), self.pk, 'updated_at', using=self._state.db,
+            )
+
+
+class SolarSchedule(TimestampedScheduleMixin):
     """Schedule following astronomical patterns.
 
     Example: to run every sunrise in New York City:
@@ -160,7 +228,7 @@ class SolarSchedule(models.Model):
         )
 
 
-class IntervalSchedule(models.Model):
+class IntervalSchedule(TimestampedScheduleMixin):
     """Schedule executing on a regular interval.
 
     Example: execute every 2 days:
@@ -243,7 +311,7 @@ class IntervalSchedule(models.Model):
         return self.period[:-1]
 
 
-class ClockedSchedule(models.Model):
+class ClockedSchedule(TimestampedScheduleMixin):
     """clocked schedule."""
 
     clocked_time = models.DateTimeField(
@@ -285,7 +353,7 @@ class ClockedSchedule(models.Model):
             return cls.objects.filter(**spec).first()
 
 
-class CrontabSchedule(models.Model):
+class CrontabSchedule(TimestampedScheduleMixin):
     """Timezone Aware Crontab-like schedule.
 
     Example:  Run every hour at 0 minutes for days of month 10-15:
@@ -451,10 +519,12 @@ class PeriodicTasks(models.Model):
     """Out-of-band change marker for the beat scheduler.
 
     This stores a single row with ``ident=1``. ``last_update`` is
-    bumped for changes not captured by ``auto_now`` timestamps on
+    bumped for changes not captured by timestamps on
     :class:`~.PeriodicTask` or schedule models (deletions and admin bulk
     ``queryset.update()``). Inserts and in-place edits are detected by
-    reading ``MAX(date_changed)`` / ``MAX(updated_at)`` instead.
+    reading ``MAX(date_changed)`` / ``MAX(updated_at)`` instead. Saves
+    inside an atomic block restamp those fields at commit time so the
+    ``MAX()`` cursor follows visibility order.
     """
 
     ident = models.SmallIntegerField(default=1, primary_key=True, unique=True)
@@ -706,7 +776,14 @@ class PeriodicTask(models.Model):
             self.last_run_at = None
         self._clean_expires()
         self.validate_unique()
+        skip_change_detection = _ensure_tracking_in_update_fields(
+            kwargs, 'date_changed', _PERIODIC_TASK_HOUSEKEEPING_FIELDS,
+        )
         super().save(*args, **kwargs)
+        if not skip_change_detection:
+            _restamp_tracking_field_on_commit(
+                type(self), self.pk, 'date_changed', using=self._state.db,
+            )
 
     def _clean_expires(self):
         if self.expire_seconds is not None and self.expires:
