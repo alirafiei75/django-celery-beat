@@ -738,6 +738,10 @@ class PeriodicTask(models.Model):
         verbose_name = _('periodic task')
         verbose_name_plural = _('periodic tasks')
         indexes = [
+            models.Index(
+                fields=['enabled'],
+                name='beat_periodic_enabled_idx',
+            ),
             models.Index(fields=['date_changed']),
         ]
 
