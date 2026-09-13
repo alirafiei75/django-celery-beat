@@ -77,7 +77,10 @@ updates that cannot be observed via ``auto_now`` timestamps.
 Beat detects schedule changes with ``PeriodicTasks.last_change()``, which
 combines that marker with ``MAX(date_changed)`` / ``MAX(updated_at)`` from
 the task and schedule tables. Ordinary ``save()`` calls are detected from
-those timestamps and do not bump the marker row.
+those timestamps and do not bump the marker row. Saves inside an
+``atomic()`` block (including ``ATOMIC_REQUESTS``) also restamp that row
+after commit so overlapping transactions stay visible to Beat; that is an
+extra per-row write, not a write to the singleton marker.
 
 If you update periodic tasks in bulk (e.g. ``QuerySet.update()``), notify
 Beat manually:

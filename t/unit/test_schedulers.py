@@ -2158,6 +2158,40 @@ class test_change_detection(SchedulerCase):
         after = IntervalSchedule.objects.get(pk=interval.pk).updated_at
         assert after == before
 
+    def test_restamp_callback_exception_is_logged_not_raised(
+            self, django_capture_on_commit_callbacks,
+    ):
+        """A failed post-commit restamp must not fail the caller."""
+        from django_celery_beat.models import \
+            _restamp_tracking_field_on_commit  # noqa: PLC0415
+        qs = MagicMock()
+        qs.update.side_effect = RuntimeError('transient db error')
+        with patch.object(
+            PeriodicTask._default_manager, 'filter', return_value=qs,
+        ), patch(
+            'django_celery_beat.models.logger.warning',
+        ) as mock_warning, django_capture_on_commit_callbacks(execute=True):
+            _restamp_tracking_field_on_commit(
+                PeriodicTask, self.m1.pk, 'date_changed', using=None,
+            )
+        mock_warning.assert_called_once()
+        assert 'Failed to restamp' in mock_warning.call_args.args[0]
+
+    def test_update_changed_callback_exception_is_logged_not_raised(
+            self, django_capture_on_commit_callbacks,
+    ):
+        """A failed post-commit marker bump must not fail the caller."""
+        qs = MagicMock()
+        qs.update.side_effect = RuntimeError('transient db error')
+        with patch.object(
+            PeriodicTasks.objects, 'filter', return_value=qs,
+        ), patch(
+            'django_celery_beat.models.logger.warning',
+        ) as mock_warning, django_capture_on_commit_callbacks(execute=True):
+            PeriodicTasks.update_changed()
+        mock_warning.assert_called_once()
+        assert 'Failed to bump PeriodicTasks' in mock_warning.call_args.args[0]
+
 
 @pytest.mark.django_db
 class test_model_PeriodicTasks(SchedulerCase):

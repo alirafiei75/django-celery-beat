@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import timezone_field
 from celery import current_app, schedules
+from celery.utils.log import get_logger
 # cron-descriptor >= 2.0 renamed *Exception to *Error
 from cron_descriptor import Options as CronDescriptorOptions
 from cron_descriptor import get_description
@@ -31,6 +32,8 @@ from . import querysets, validators
 from .clockedschedule import clocked
 from .tzcrontab import TzAwareCrontab
 from .utils import make_aware, now
+
+logger = get_logger(__name__)
 
 _CRON_DESCRIPTOR_OPTIONS = CronDescriptorOptions()
 _CRON_DESCRIPTOR_OPTIONS.use_24hour_time_format = False
@@ -126,6 +129,12 @@ def _restamp_tracking_field_on_commit(model_cls, pk, field_name, using=None):
     transaction can therefore carry an older stamp than one Beat already
     consumed. Updating the row after commit makes ``MAX()`` follow
     visibility order. Autocommit saves are left as a single write.
+
+    If the process dies between ``COMMIT`` and this restamp, the row keeps
+    its save-time stamp and may sit below Beat's watermark until the
+    periodic full sync (``SCHEDULE_SYNC_MAX_INTERVAL``). Callback errors
+    are logged and swallowed so a successful commit is not turned into a
+    caller-facing failure.
     """
     if pk is None:
         return
@@ -133,10 +142,17 @@ def _restamp_tracking_field_on_commit(model_cls, pk, field_name, using=None):
         return
 
     def _touch():
-        manager = model_cls._default_manager
-        if using:
-            manager = manager.using(using)
-        manager.filter(pk=pk).update(**{field_name: now()})
+        try:
+            manager = model_cls._default_manager
+            if using:
+                manager = manager.using(using)
+            manager.filter(pk=pk).update(**{field_name: now()})
+        except Exception as exc:
+            logger.warning(
+                'Failed to restamp %s.%s for pk=%s after commit: %r',
+                model_cls.__name__, field_name, pk, exc,
+                exc_info=True,
+            )
 
     transaction.on_commit(_touch, using=using)
 
@@ -525,6 +541,10 @@ class PeriodicTasks(models.Model):
     reading ``MAX(date_changed)`` / ``MAX(updated_at)`` instead. Saves
     inside an atomic block restamp those fields at commit time so the
     ``MAX()`` cursor follows visibility order.
+
+    Under ``ATOMIC_REQUESTS`` (or any surrounding ``atomic()``), that
+    restamp is an extra per-row write after commit. It does not touch this
+    singleton, so it does not recreate the old lock hotspot.
     """
 
     ident = models.SmallIntegerField(default=1, primary_key=True, unique=True)
@@ -541,17 +561,35 @@ class PeriodicTasks(models.Model):
 
     @classmethod
     def update_changed(cls, **kwargs):
+        """Bump the change marker after the current transaction commits.
+
+        Call this after bulk ``QuerySet.update()`` (and similar paths that
+        bypass model ``save()``). The marker write runs via
+        ``transaction.on_commit()``, so reading ``last_change()`` in the
+        same still-open transaction will not see the bump yet. Callback
+        errors are logged and swallowed so a successful commit is not
+        turned into a caller-facing failure; Beat's periodic full sync
+        remains a backstop.
+        """
         def _bump():
-            updated = cls.objects.filter(ident=1).update(
-                last_update=now(),
-            )
-            if not updated:
-                try:
-                    cls.objects.create(ident=1, last_update=now())
-                except IntegrityError:
-                    cls.objects.filter(ident=1).update(
-                        last_update=now(),
-                    )
+            try:
+                updated = cls.objects.filter(ident=1).update(
+                    last_update=now(),
+                )
+                if not updated:
+                    try:
+                        cls.objects.create(ident=1, last_update=now())
+                    except IntegrityError:
+                        cls.objects.filter(ident=1).update(
+                            last_update=now(),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    'Failed to bump PeriodicTasks change marker '
+                    'after commit: %r',
+                    exc,
+                    exc_info=True,
+                )
 
         transaction.on_commit(_bump)
 

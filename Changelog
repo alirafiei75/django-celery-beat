@@ -20,6 +20,16 @@ Next
   - Normal ``PeriodicTask`` / schedule ``save()`` no longer writes to the
     singleton marker row; deletes and admin bulk ``queryset.update()`` still
     bump it.
+  - Under ``ATOMIC_REQUESTS`` / ``atomic()``, each real schedule edit still
+    gets a short post-commit restamp of that row's ``date_changed`` /
+    ``updated_at``. That is an extra per-row write, not a return of the
+    shared ``ident=1`` lock hotspot.
+
+- Migration ``0021`` adds ``updated_at`` columns and indexes (plus a
+  ``date_changed`` index). On large tables this can be expensive (table
+  rebuilds on older MySQL; blocking index builds on PostgreSQL unless you
+  use ``CREATE INDEX CONCURRENTLY``). Plan a maintenance window or apply
+  equivalent index DDL out-of-band if needed.
 
 - **Breaking change for undocumented use of ``PeriodicTasks.last_update``:**
 
